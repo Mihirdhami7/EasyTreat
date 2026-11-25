@@ -14,6 +14,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 from urllib.parse import quote_plus
 
@@ -28,12 +29,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "1fy%j02cvs&0$)-ny@3pj6l$+p)%cl6_ogu0h8-z=!&sy*v_ju"
+# Read only from Backend/.env (never written in code). Django uses it to sign data such as
+# password-reset tokens; a new key for production: python -c "import secrets; print(secrets.token_urlsafe(50))"
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY is missing. Add it to Backend/.env")
+
+# Razorpay keys and the booking fee are now stored in the database and edited on the
+# super admin Settings page (backend/platform_settings.py). Old .env reading kept as a comment
+# until every page is tested on the site, then these comments can be removed:
+# RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
+# RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
+# APPOINTMENT_BOOKING_FEE = int(os.getenv("APPOINTMENT_BOOKING_FEE", "100"))
+# Public address of the React site (links in emails, e.g. the "set your password" invitation)
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").strip().rstrip("/")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "False").strip().lower() in ("1", "true", "yes", "on")
 
-ALLOWED_HOSTS = ["*"]  # Allow all hosts in development
+_allowed_hosts = os.getenv("ALLOWED_HOSTS", "*")
+ALLOWED_HOSTS = [host.strip() for host in _allowed_hosts.split(",") if host.strip()]
 
 
 # Application definition
@@ -143,6 +158,8 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",  
     "http://localhost:5173",  # React frontend URL
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",  # same dev server opened via IP address
 ]
 
 CORS_ALLOW_METHODS = [
@@ -173,16 +190,30 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = False  # Set to True in production with HTTPS
 SESSION_COOKIE_SAMESITE = 'Lax'  # Use 'None' if frontend and backend are on different domains
 SESSION_EXPIRY_HOURS = 4
+# Login session cookie (httpOnly: JavaScript cannot read it). One login per browser.
+# Local dev (localhost:5173 -> localhost:8000) is same-site, so Lax works over http.
+# Production with the site and the API on different domains needs AUTH_COOKIE_SAMESITE=None
+# and AUTH_COOKIE_SECURE=1 (https).
+AUTH_COOKIE_NAME = "hms_session"
+AUTH_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "Lax")
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "0").strip().lower() in ("1", "true", "yes", "on")
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+# Gmail address / App Password / sender name come from the super admin Settings page (database)
+EMAIL_BACKEND = "backend.mail_backend.SettingsEmailBackend"
 EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'hmstemp07@gmail.com'  # Your email address
-EMAIL_HOST_PASSWORD = 'ivdi baqv kzdj tqzd'  # Your email password or app password
-DEFAULT_FROM_EMAIL = 'HMS Healthcare <hmstemp07@gmail.com>'
+# The system mailbox (used for ALL outgoing mail) is now stored in the database and edited on the
+# super admin Settings page. Old .env reading kept as a comment until the site is fully tested:
+# EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "").strip()
+# EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "").strip()
+# DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "").strip() or f"EasyTreat Hospital <{EMAIL_HOST_USER}>"
+# Empty placeholders: some code still passes these names; SettingsEmailBackend fills in the real sender.
+EMAIL_HOST_USER = ""
+EMAIL_HOST_PASSWORD = ""
+DEFAULT_FROM_EMAIL = ""
 
-EMAIL_TIMEOUT = 60
+EMAIL_TIMEOUT = 20
 
 # For development/testing, use console backend to avoid email sending:
 # EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'  # This will print emails to console instead of sending
@@ -193,6 +224,15 @@ OTP_SETTINGS = {
     'LENGTH': 6,  # 6 digit OTP
 }
 
+REST_FRAMEWORK = {
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': os.getenv('DRF_ANON_THROTTLE_RATE', '30/minute'),
+    },
+}
+
 # Media files (Uploaded files)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
@@ -200,17 +240,18 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Configure where to store uploaded files
 DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
 
-# MongoDB Settings
+# MongoDB Atlas - every part comes from Backend/.env:
+#   MONGO_USERNAME / MONGO_PASSWORD  the database user (Atlas > Database Access)
+#   MONGO_CLUSTER                    the cluster address, e.g. cluster0.xxxxx.mongodb.net (Atlas > Connect)
+#   MONGO_DATABASE                   the database name inside the cluster
+_missing = [k for k in ("MONGO_USERNAME", "MONGO_PASSWORD", "MONGO_CLUSTER", "MONGO_DATABASE") if not os.getenv(k)]
+if _missing:
+    raise ImproperlyConfigured(f"Missing in Backend/.env: {', '.join(_missing)}")
 MONGO_USERNAME = quote_plus(os.getenv('MONGO_USERNAME'))
 MONGO_PASSWORD = quote_plus(os.getenv('MONGO_PASSWORD'))
-MONGO_CLUSTER = os.getenv('MONGO_CLUSTER')
-MONGO_DATABASE = os.getenv('MONGO_DATABASE')
+MONGO_CLUSTER = os.getenv('MONGO_CLUSTER').strip()
+MONGO_DATABASE = os.getenv('MONGO_DATABASE').strip()
 
-# MongoDB URI - use the cluster from your screenshot
-MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.sqzac.mongodb.net/{MONGO_DATABASE}?retryWrites=true&w=majority"
+MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@{MONGO_CLUSTER}/{MONGO_DATABASE}?retryWrites=true&w=majority"
 
 
-#razor pay
-# settings.py
-RAZORPAY_KEY_ID = "rzp_test_vcajFSq04fkAk"
-RAZORPAY_SECRET_KEY = "1z3ak928OOoeZehAR6rcgTxO"

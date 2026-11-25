@@ -1,9 +1,12 @@
 from pymongo import MongoClient
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import random
 import string
 import hashlib
+import logging
 import backend.settings as backend_settings
+
+logger = logging.getLogger(__name__)
 
 # Validate settings
 MONGO_URI = getattr(backend_settings, "MONGO_URI", None)
@@ -21,11 +24,45 @@ users_collection = db["users"]
 temp_users_collection = db["temp_users"]
 otp_collection = db["otps"]
 sessions_collection = db["sessions"]
-doctors_collection = db["doctors"]
+# DEPRECATED: doctors_collection - use staff_collection instead
+# doctors_collection = db["doctors"]
+staff_collection = db["staff"]
 payments_collection = db["payments"]
 departments_collection = db["departments"]
 hospitals_collection = db["hospitals"]
-notifications_collection = db["notifications"]
+class _NotificationsCollection:
+    """notifications collection that skips notification types the super admin switched off
+    (Settings page). Everything except insert_one / insert_many goes straight to the collection."""
+
+    class _Skipped:
+        inserted_id = None
+        inserted_ids = []
+        acknowledged = True
+
+    def __init__(self, collection):
+        self._collection = collection
+
+    def __getattr__(self, name):
+        return getattr(self._collection, name)
+
+    @staticmethod
+    def _enabled(doc):
+        from backend.platform_settings import notification_enabled  # lazy: avoids a circular import
+        return notification_enabled((doc or {}).get("type"))
+
+    def insert_one(self, document, *args, **kwargs):
+        if not self._enabled(document):
+            return self._Skipped()
+        return self._collection.insert_one(document, *args, **kwargs)
+
+    def insert_many(self, documents, *args, **kwargs):
+        documents = [d for d in documents if self._enabled(d)]
+        if not documents:
+            return self._Skipped()
+        return self._collection.insert_many(documents, *args, **kwargs)
+
+
+notifications_collection = _NotificationsCollection(db["notifications"])
 prescriptions_collection = db["prescriptions"]
 invoices_collection = db["invoices"]
 temp_appointments_collection = db["temp_appointments"]
@@ -33,15 +70,60 @@ appointments_collection = db["appointments"]
 orders_collection = db["orders"]
 products_collection = db["products"]
 temp_products_collection = db["temp_products"]
+diseases_collection = db["diseases"]
+medicine_requests_collection = db["medicine_requests"]
 
-# Helpers
-def generate_otp(length: int = 6) -> str:
-    return "".join(random.choices(string.digits, k=length))
+
+def ensure_indexes():
+    """Create commonly used MongoDB indexes and TTL indexes."""
+    try:
+        users_collection.create_index("email")
+        users_collection.create_index([("userType", 1), ("hospitalName", 1)])
+
+        staff_collection.create_index("email")
+        staff_collection.create_index([("role", 1), ("hospitalName", 1)])
+
+        sessions_collection.create_index("token")
+        sessions_collection.create_index("expires_at", expireAfterSeconds=0)
+
+        otp_collection.create_index([("email", 1), ("otp", 1)])
+        otp_collection.create_index("expires_at", expireAfterSeconds=0)
+
+        appointments_collection.create_index([("patient.email", 1), ("appointmentDate", -1)])
+        appointments_collection.create_index([("doctor.email", 1), ("appointmentDate", -1)])
+        appointments_collection.create_index([("hospitalName", 1), ("status", 1)])
+
+        products_collection.create_index([("hospitalName", 1), ("is_approved", 1)])
+        orders_collection.create_index([("hospitalName", 1), ("status", 1)])
+        notifications_collection.create_index([("userEmail", 1), ("createdAt", -1)])
+        diseases_collection.create_index([("department", 1), ("name", 1)])
+        payments_collection.create_index("razorpay_order_id", unique=True, sparse=True)
+        medicine_requests_collection.create_index([("hospitalName", 1), ("status", 1), ("createdAt", -1)])
+    except Exception as exc:
+        # Keep app startup resilient even if index creation fails.
+        logger.warning("Mongo index initialization skipped/failed: %s", exc)
+
+
+ensure_indexes()
+
+# Helper Functions
+def generate_otp(length=6):
+    """Generate random OTP"""
+    return ''.join(random.choices(string.digits, k=length))
+
+def generate_session_id(email):
+    """Generate unique session ID"""
+    timestamp = str(datetime.now().timestamp())
+    random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    raw = f"{email}:{timestamp}:{random_str}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 def clear_expired_sessions():
-    now = datetime.now()
+    """Remove expired sessions"""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # stored dates are naive UTC
     sessions_collection.delete_many({"expires_at": {"$lt": now}})
 
-def generate_session_id(email: str) -> str:
-    timestamp = datetime.now().isoformat()
-    return hashlib.sha256(f"{email}{timestamp}".encode()).hexdigest()
+def clear_expired_otps():
+    """Remove expired OTPs"""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # stored dates are naive UTC
+    otp_collection.delete_many({"expires_at": {"$lt": now}})

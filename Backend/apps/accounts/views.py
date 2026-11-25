@@ -1,518 +1,991 @@
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from datetime import datetime, timedelta, timezone
+import hashlib
+import logging
+import secrets
+
+import bcrypt
+import jwt
+
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.core.mail import EmailMultiAlternatives
-from django.template.loader import render_to_string
-from django.utils.html import strip_tags
-import bcrypt
-import json
-import random
-import string
-import hashlib
-from datetime import datetime, timedelta
-import backend.settings as settings
 
-# Import from views.py where collections are defined
+from rest_framework import generics, status, exceptions
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.throttling import AnonRateThrottle
+
 from backend.db import (
-    users_collection, temp_users_collection, otp_collection, sessions_collection, doctors_collection,
-    generate_otp, generate_session_id, clear_expired_sessions,
-
+    client,
+    users_collection, staff_collection, otp_collection, sessions_collection, hospitals_collection,
+    generate_otp, clear_expired_otps
 )
+from backend import settings
+from .serializers import (
+    RegisterSerializer, VerifyEmailSerializer, LoginSerializer, LogoutSerializer, UserProfileSerializer,
+    PasswordResetRequestSerializer, PasswordResetConfirmSerializer,
+)
+from .permissions import IsSameUser, IsSuperAdminOrIsSameHospitalAdmin
+from .models import UserDocument, OTPDocument
+from .authentication import JWTAuthentication
 
-@csrf_exempt
-def register_user(request):
-    if request.method == "POST":
-        try:
-            data = request.POST.dict() if request.content_type.startswith('multipart') else json.loads(request.body)
+logger = logging.getLogger(__name__)
+
+# Role names as stored in the users collection (token may carry e.g. "superAdmin").
+CANONICAL_ROLES = {r.lower(): r for r in ("Patient", "Doctor", "Admin", "Supplier", "SuperAdmin")}
+
+
+def canonical_role(user_type):
+    return CANONICAL_ROLES.get(str(user_type or "").strip().lower(), user_type)
+
+
+def account_query(request_user):
+    """
+    Mongo filter for the account behind the current login.
+    A patient can have one account per hospital (same email), so the hospital
+    chosen at login (stored in the token) is part of the lookup for patients.
+    """
+    role = canonical_role(getattr(request_user, "userType", None))
+    query = {"email": getattr(request_user, "email", None), "userType": role}
+    hospital = getattr(request_user, "hospitalName", None)
+    if role == "Patient" and hospital:
+        query["hospitalName"] = hospital
+    return query
+
+
+def utc_now():
+    """Naive UTC datetime (pymongo returns naive datetimes, so compare like with like)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+class RegisterUserAPIView(generics.CreateAPIView):
+    """
+    User registration endpoint
+    POST /api/accounts/register/
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [AnonRateThrottle]
+    serializer_class = RegisterSerializer
+    parser_classes = [MultiPartParser, FormParser]
             
-            email = data.get("email")
-            if not email:
-                return JsonResponse({"status": "error", "message": "Email is required"}, status=400)
+    def create(self, request, *args, **kwargs):
+        """Handle user registration with validation"""
+        serializer = self.get_serializer(data=request.data, context={'request': request})
+        
+        if not serializer.is_valid():
+            return Response({
+                "status": "error",
+                "errors": serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        data = serializer.validated_data
+        email = data.get("email")
+        userType = data.get("userType", "Patient")
 
-            existing_user = users_collection.find_one({"email": email})
-            if existing_user:
-                return JsonResponse({"status": "error", "message": "User already exists"}, status=400)
-
-            otp = generate_otp()
-            expiry_time = datetime.now() + timedelta(minutes=2) 
-
-            temp_user_data = {
-                "email": email,
-                "name": data.get("name"),
-                "password": data.get("password"),
-                "contactNo": data.get("contactNo"),
-                "userType": data.get("userType", "Patient"),
-                "gender": data.get("gender"),
-                "dateOfBirth": data.get("dateOfBirth"),
-                "hospitalName": data.get("hospitalName"),
-                "created_at": datetime.now(),
-                "photo": None  # Default photo value
-            }
-
-            # Handle photo upload if present
-            if request.FILES and 'photo' in request.FILES:
-                photo = request.FILES['photo']
-                photo_name = default_storage.save(
-                    f"profile_photos/{email}/{photo.name}", 
-                    ContentFile(photo.read())
-                )
-                temp_user_data["photo"] = default_storage.url(photo_name)
-
-            # Add doctor-specific fields if userType is Doctor
-            if data.get("userType") == "Doctor":
-                temp_user_data.update({
-                    "doctorQualification": data.get("doctorQualification"),
-                    "doctorSpecialization": data.get("doctorSpecialization")
-                })
-
-                if request.FILES and 'doctorCertificate' in request.FILES:
-                    certificate = request.FILES['doctorCertificate']
-                    cert_path = f"doctor_certificates/{email}/{certificate.name}"
-                    cert_name = default_storage.save(cert_path, ContentFile(certificate.read()))
-                    temp_user_data["doctorCertificate"] = settings.MEDIA_URL + cert_name
-
-
-            # Add supplier-specific fields if userType is Supplier
-            if data.get("userType") == "Supplier":
-                temp_user_data.update({
-                    "companyName": data.get("companyName"),
-                    "companyStartingDate": data.get("companyStartingDate")
-                })
-
-                if request.FILES and 'companyLicense' in request.FILES:
-                    license_file = request.FILES['companyLicense']
-                    license_path = f"company_licenses/{email}/{license_file.name}"
-                    license_name = default_storage.save(license_path, ContentFile(license_file.read()))
-                    temp_user_data["companyLicense"] = settings.MEDIA_URL + license_name
-
-
-            # Store OTP with expiry time
-            otp_collection.insert_one({
-                "email": email,
-                "otp": otp,
-                "created_at": datetime.utcnow(),
-                "expires_at": expiry_time,
-                "verified": False
-            })
-
-            # Store temporary user data
-            temp_users_collection.insert_one(temp_user_data)
-
-            # Send OTP via email
-            try:
-                if not settings.EMAIL_HOST_USER:
-                    raise ValueError("EMAIL_HOST_USER is not configured in settings.")
-
-                message = f"""
-                <html>
-                    <body>
-                        <h2>Welcome to HMS</h2>
-                        <p>Your OTP for email verification is: <strong>{otp}</strong></p>
-                        <p>Please enter this OTP to verify your email address.</p>
-                        <p>Thank you for registering!</p>
-                    </body>
-                </html> 
-                """
-
-                # Send email
-                email_message = EmailMultiAlternatives(
-                    subject="HMS - Email Verification OTP",
-                    body=message,
-                    from_email=f'HMS Team <{settings.EMAIL_HOST_USER}>',
-                    to=[email],
-                )
-                email_message.send(fail_silently=False)
-
-                print(f"OTP email sent successfully to {email}")
-
-            except Exception as e:
-                print(f"Error sending email: {str(e)}")
-                import traceback
-                print(traceback.format_exc())
-                
-                return JsonResponse({
+        hospital_name = (data.get("hospitalName") or "").strip()
+        if userType in ("Patient", "Doctor", "Admin"):
+            if not hospital_name or not hospitals_collection.find_one({"name": hospital_name}):
+                return Response({
                     "status": "error",
-                    "message": "Failed to send OTP email. Please try again."
-                }, status=500)
+                    "errors": {"hospitalName": ["Please select a hospital from the list"]}
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            return JsonResponse({
-                "status": "success",
-                "message": "Please check your email for verification OTP"
-            }, status=200)
-
-        except Exception as e:
-            print(f"Registration error: {str(e)}")
-            return JsonResponse({
-                "status": "error", 
-                "message": f"Registration failed: {str(e)}"
-            }, status=500)
-
-    return JsonResponse({"status": "error", "message": "Invalid request method"}, status=405)
-
-@csrf_exempt
-def verify_email(request):
-    if request.method == "POST":
+        # Check if user already exists.
+        # A patient may hold one account per hospital (same email); every other
+        # combination must be unique per email.
+        existing = list(users_collection.find({"email": email}, {"userType": 1, "hospitalName": 1}))
+        if userType == "Patient":
+            clash = any(
+                u.get("userType") != "Patient" or u.get("hospitalName") == hospital_name
+                for u in existing
+            )
+            clash_msg = (f"You already have a patient account at {hospital_name}"
+                         if any(u.get("hospitalName") == hospital_name for u in existing)
+                         else "This email is already used by a non-patient account")
+        else:
+            clash = bool(existing)
+            clash_msg = "User with this email already exists"
+        if clash:
+            return Response({
+                "status": "error",
+                "errors": {"email": [clash_msg]}
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
         try:
-            data = json.loads(request.body)
-            email = data.get("email")
-            otp = data.get("otp")
+            # Create base user data
+            base_user = UserDocument.create_base_user(
+                email=email,
+                name=data.get("name"),
+                password=data.get("password"),
+                contactNo=data.get("contactNo"),
+                userType=userType,
+                gender=data.get("gender"),
+                dateOfBirth=data.get("dateOfBirth"),
+                photo=request.FILES.get('photo'),
+                is_active=False
+            )
 
-            print(f"opt for EasyTreat system: {otp}")
+            # Create user document based on type
+            if userType == "Doctor":
+                user_document = UserDocument.create_doctor(
+                    base_data=base_user,
+                    hospitalName=data.get("hospitalName"),
+                    doctorQualification=data.get("doctorQualification"),
+                    doctorSpecialization=data.get("doctorSpecialization"),
+                    certificate=request.FILES.get('doctorCertificate')
+                )
+            elif userType == "Supplier":
+                user_document = UserDocument.create_supplier(
+                    base_data=base_user,
+                    companyName=data.get("companyName"),
+                    companyStartingDate=data.get("companyStartingDate"),
+                    license_file=request.FILES.get('companyLicense')
+                )
+            elif userType == "Patient":
+                user_document = UserDocument.create_patient(
+                    base_user,
+                    hospitalName=data.get("hospitalName")
+                )
+            elif userType == "Admin":
+                user_document = UserDocument.create_admin(
+                    base_user,
+                    hospitalName=data.get("hospitalName")
+                )
+            else:
+                return Response({
+                    "status": "error",
+                    "message": "Invalid user type"
+                }, status=status.HTTP_400_BAD_REQUEST)
 
+            otp_code = generate_otp()
+            otp_document = OTPDocument.create(email=email, otp=otp_code, expiry_minutes=2)
+            inserted_user_id = None
+
+            # Use Mongo transaction when available; fallback to normal writes otherwise.
+            try:
+                with client.start_session() as mongo_session:
+                    with mongo_session.start_transaction():
+                        user_insert = users_collection.insert_one(user_document, session=mongo_session)
+                        otp_collection.insert_one(otp_document, session=mongo_session)
+                        inserted_user_id = user_insert.inserted_id
+            except Exception:
+                user_insert = users_collection.insert_one(user_document)
+                otp_collection.insert_one(otp_document)
+                inserted_user_id = user_insert.inserted_id
+
+            # Verify insertion
+            result = users_collection.find_one({"_id": inserted_user_id})
+            if not result:
+                raise exceptions.APIException("Failed to create user")
+
+            email_error = None
+            try:
+                self._send_otp_email(email, otp_code, data.get("name"))
+            except Exception as exc:
+                email_error = exc
+
+            if email_error is not None and settings.DEBUG:
+                # Local development only: email not configured -> print the OTP in the server log.
+                logger.warning("OTP email failed (%s). DEBUG OTP for %s: %s", email_error, email, otp_code)
+                print(f"[DEBUG] Signup OTP for {email}: {otp_code}  (email sending failed: {email_error})", flush=True)
+            elif email_error is not None:
+                # Rollback user creation if email fails
+                logger.error("Verification email failed for %s: %s", email, email_error)
+                users_collection.delete_one({"_id": inserted_user_id})
+                otp_collection.delete_many({"email": email, "purpose": {"$ne": "password_reset"}})
+                return Response({
+                    "status": "error",
+                    "message": "Could not send the verification email. Please try again later."
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # Prepare response (remove sensitive data)
+            result.pop("hpassword", None)
+            result.pop("password", None)
+            result["_id"] = str(result["_id"])
+            
+            # Use serializer's to_representation to filter fields
+            response_serializer = self.get_serializer(result)
+            
+            return Response({
+                "status": "success",
+                "message": "Registration successful. Please verify your email with the OTP sent.",
+                "user": response_serializer.data
+            }, status=status.HTTP_201_CREATED)
+        
+        except Exception as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _send_otp_email(self, email: str, otp: str, name: str = None):
+        """Send OTP verification email"""
+        from backend.platform_settings import mail_configured
+        if not mail_configured():
+            raise Exception("system mailbox not configured (super admin Settings -> Email account)")
+        
+        display = name or email.split("@", 1)[0]
+        text = f"Hello {display},\nYour OTP for HMS registration is: {otp}\n\nThis OTP will expire in 2 minutes."
+        html = f"<p>Hello {display},</p><p>Your OTP for HMS registration is: <strong>{otp}</strong></p><p>This OTP will expire in 2 minutes.</p>"
+        
+        msg = EmailMultiAlternatives(
+            subject="HMS - Email Verification OTP",
+            body=text,
+            from_email=settings.EMAIL_HOST_USER,
+            to=[email],
+        )
+        msg.attach_alternative(html, "text/html")
+        msg.send(fail_silently=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+class VerifyEmailAPIView(generics.GenericAPIView):
+    """
+    Email verification endpoint
+    POST /api/accounts/verify-email/
+    """
+    serializer_class = VerifyEmailSerializer
+    permission_classes = [AllowAny]
+    throttle_classes = [AnonRateThrottle]
+    
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({
+                "status": "error",
+                "errors": serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        email = serializer.validated_data.get("email")
+        otp = serializer.validated_data.get("otp")
+        
+        try:
+            clear_expired_otps()
             otp_record = otp_collection.find_one({
                 "email": email,
                 "otp": otp,
                 "verified": False
             })
-
-            if not otp_record:
-                return JsonResponse({"status": "error", "message": "Invalid OTP"}, status=400)
-
-            # Check if OTP has expired
-            current_time = datetime.utcnow()
-            if current_time > otp_record["expires_at"]:
-                otp_collection.delete_one({"_id": otp_record["_id"]})
-                return JsonResponse({
-                    "status": "error", 
-                    "message": "OTP has expired. Please request a new one"
-                }, status=400)
-
-            # Get user data from temp collection
-            temp_user = temp_users_collection.find_one({"email": email})
-            if not temp_user:
-                return JsonResponse({"status": "error", "message": "User data not found"}, status=400)
-
-            try:
-                if '_id' in temp_user:
-                    del temp_user['_id']
-
-                password = temp_user.get("password")
-                if password:
-                    hashed_password = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-                    temp_user["hpassword"] = hashed_password.decode("utf-8")
-                
-                result = users_collection.insert_one(temp_user)
-                
-                if not result.inserted_id:
-                    raise Exception("Failed to insert user")
-
-                # Clean up temp data
-                otp_collection.delete_one({"_id": otp_record["_id"]})
-                temp_users_collection.delete_one({"email": email})
-
-                return JsonResponse({
-                    "status": "success",
-                    "message": "Email verified successfully"
-                }, status=200)
-
-            except Exception as e:
-                print(f"Error storing user: {str(e)}")
-                return JsonResponse({
-                    "status": "error",
-                    "message": f"Error storing user: {str(e)}"
-                }, status=500)
-
-        except Exception as e:
-            print(f"Verification error: {str(e)}")
-            return JsonResponse({"status": "error", "message": str(e)}, status=500)
-
-    return JsonResponse({"status": "error", "message": "Invalid request method"}, status=405)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@csrf_exempt
-def login_view(request):
-    if request.method == "POST":
-        try:
-            clear_expired_sessions()  # Remove expired sessions before login
-
-            data = json.loads(request.body)
-            email = data.get("email", "").strip().lower()
-            password = data.get("password", "")
-            category = data.get("category", "")
-            hospital_name = data.get("hospitalName", "")
-
-            if not email or not password:
-                return JsonResponse({"status": "error", "message": "Email and password are required"}, status=400)
-
-            if not hospital_name and email != "21it402@bvmengineering.ac.in" and category != "Supplier":  # Super admin doesn't need hospital
-                return JsonResponse({"status": "error", "message": "Hospital selection is required"}, status=400)
             
-            # User lookup
-            user = None
+            if not otp_record:
+                return Response({
+                    "status": "error",
+                    "message": "Invalid OTP"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if datetime.utcnow() > otp_record["expires_at"]:
+                otp_collection.delete_one({"_id": otp_record["_id"]})
+                return Response({
+                    "status": "error",
+                    "message": "OTP has expired. Please request a new one"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Activate the not-yet-activated account(s) for this email
+            # (a patient may already have an active account at another hospital).
+            result = users_collection.update_many(
+                {"email": email, "is_active": {"$ne": True}},
+                {"$set": {
+                    "is_active": True,
+                    "activated_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }}
+            )
+            
+            if result.modified_count == 0:
+                return Response({
+                    "status": "error",
+                    "message": "User not found"
+                }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Delete used OTP
+            otp_collection.delete_one({"_id": otp_record["_id"]})
+            
+            return Response({
+                "status": "success",
+                "message": "Email verified successfully. You can now login."
+            }, status=status.HTTP_200_OK)
+        
+        except Exception as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-           # Check if it's a super admin
-            if email == "21it402@bvmengineering.ac.in":
-                user = users_collection.find_one({"email": email})
-            else:
-                # For regular user lookup based on category
-                if category == "Doctor":
-                    # Doctors are stored in doctors_collection
-                    user_query = {
-                        "email": email,
-                        "userType": category,
-                        "Hospital": hospital_name
-                    }
-                    user = doctors_collection.find_one(user_query)
-                elif category == "Supplier":
-                    # Suppliers don't need hospital name in query
-                    user_query = {
-                        "email": email,
-                        "userType": category
-                    }
-                    user = users_collection.find_one(user_query)
-                else:
-                    # For other user types (Patient, Admin)
-                    user_query = {
-                        "email": email,
-                        "userType": category,
-                        "hospitalName": hospital_name
-                    }
-                    user = users_collection.find_one(user_query)
+
+
+
+
+
+
+
+class LoginAPIView(generics.CreateAPIView):
+    """
+    User login endpoint
+    POST /api/accounts/login/
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [AnonRateThrottle]
+    serializer_class = LoginSerializer
+    
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data, context={"request": request})
+        if not serializer.is_valid():
+            return Response({
+                "status": "error",
+                "errors": serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        email = serializer.validated_data.get("email")
+        password = serializer.validated_data.get("password")
+        category = serializer.validated_data.get("category")
+        hospital_name = serializer.validated_data.get("hospitalName") or ""
+
+        try:
+            # Every account (super admin included) is checked the same way:
+            # email + password -> role -> hospital, with a clear message for each.
+            # Role / hospital messages are only given once the password is proven correct, so the
+            # form cannot be used to discover which emails or roles exist.
+            # A SuperAdmin needs no role or hospital: the correct email + password is enough.
+            user, error = self._find_login_user(email, password, category, hospital_name)
+            if error:
+                return Response({"status": "error", "message": error[0], "field": error[1]}, status=error[2])
 
             if not user:
-                return JsonResponse({"status": "error", "message": "user not found"}, status=401)
+                return Response({"status": "error", "message": "Invalid credentials. Please check your email and password.",
+                                 "field": "credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+            if not user.get("is_active", False):
+                return Response({"status": "error", "message": "Your account is not activated yet. Please contact the hospital.",
+                                 "field": "account"}, status=status.HTTP_403_FORBIDDEN)
 
-            # Password verification (bcrypt)
-            stored_hashed_password = user.get("hpassword", "").encode("utf-8")
-            if not stored_hashed_password or not bcrypt.checkpw(password.encode("utf-8"), stored_hashed_password):
-                return JsonResponse({"status": "error", "message": "Invalid credentials password is diff"}, status=401)
-
-            # Generate a new session ID
-            session_id = generate_session_id(email)
-            expires_at = datetime.now() + timedelta(hours=4)
-
-            # Store session data in MongoDB
-            session_data = {
-                "session_id": session_id,
+            # Aware UTC datetime: a naive utcnow().timestamp() is read as LOCAL time on non-UTC machines
+            exp = datetime.now(timezone.utc) + timedelta(hours=4)
+            payload = {
                 "email": email,
                 "userType": user.get("userType"),
                 "hospitalName": user.get("hospitalName"),
-                "expires_at": expires_at
+                "exp": int(exp.timestamp())
             }
-            sessions_collection.insert_one(session_data)
+            token = jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+            token_str = token if isinstance(token, str) else token.decode("utf-8")
 
-            return JsonResponse({
+            # Store session so we can invalidate on logout
+            sessions_collection.insert_one({
+                "token": token_str,
+                "email": email,
+                "userType": user.get("userType"),
+                "hospitalName": user.get("hospitalName"),
+                "expires_at": datetime.utcnow() + timedelta(hours=4),
+                "created_at": datetime.utcnow()
+            })
+
+            response = Response({
                 "status": "success",
                 "message": "Login successful",
-                "userData": {
-                    "userType": user.get("userType"),
-                    "email": email,
-                    "hospitalName": user.get("hospitalName"),
-                    "name": user.get("name"),
-                    "companyName": user.get("companyName"),
-                },
-                "session_Id": session_id
-            }, status=200)
-
+                "userData": _user_data(user),
+                "access": token_str
+            }, status=status.HTTP_200_OK)
+            # the browser keeps the login in an httpOnly session cookie (one login per browser)
+            set_session_cookie(response, token_str)
+            return response
         except Exception as e:
-            print(f"Login error: {str(e)}")
-            return JsonResponse({"status": "error", "message": f"Login failed: {str(e)}"}, status=500)
+            return Response({"status": "error", "message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
+    @staticmethod
+    def _find_login_user(email, password, category, hospital_name):
+        """
+        Returns (user, None) or (None, (message, field, http_status)).
+        field tells the login page which input to highlight: credentials | role | hospital.
+        """
+        def password_ok(u):
+            stored = u.get("hpassword", "")
+            try:
+                return bool(stored) and bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+            except ValueError:  # malformed hash
+                return False
 
-@csrf_exempt
-def check_session(request):
-    session_id = request.headers.get("Authorization") or request.COOKIES.get("session_id")
+        # every account with this email whose password matches (one email can have one account per hospital)
+        matches = [u for u in users_collection.find({"email": email}) if password_ok(u)]
+        if not matches:
+            return None, ("Invalid credentials. Please check your email and password.", "credentials",
+                          status.HTTP_401_UNAUTHORIZED)
 
-    if not session_id:
-        return JsonResponse({"status": "error", "message": "No session ID provided"}, status=401)
+        # Super admin: logs in only through the separate super admin page (category "SuperAdmin"),
+        # with email + password and no role / hospital. Any other account trying that page gets the
+        # same "Invalid credentials" answer, so the page reveals nothing.
+        super_admin = next((u for u in matches if str(u.get("userType", "")).lower() == "superadmin"), None)
+        if str(category or "").lower() == "superadmin":
+            if super_admin:
+                return super_admin, None
+            return None, ("Invalid credentials. Please check your email and password.", "credentials",
+                          status.HTTP_401_UNAUTHORIZED)
 
-    # Remove expired sessions first
-    clear_expired_sessions()
-    now = datetime.now()
+        role_matches = [u for u in matches if str(u.get("userType", "")).lower() == str(category or "").lower()]
+        if not role_matches:
+            return None, ("Please select the proper role.", "role", status.HTTP_401_UNAUTHORIZED)
 
-    # Check session in MongoDB
-    session_data = sessions_collection.find_one({"session_id": session_id})
+        if category == "Supplier":
+            return role_matches[0], None
+        if not hospital_name:
+            return None, ("Please select the proper hospital.", "hospital", status.HTTP_401_UNAUTHORIZED)
 
-    if not session_data:
-        return JsonResponse({"status": "error", "message": "Session not found"}, status=401)
+        for u in role_matches:
+            if u.get("hospitalName") == hospital_name:
+                return u, None
+            # doctors can also be linked to a hospital through the staff list
+            if category == "Doctor" and staff_collection.find_one(
+                    {"email": email, "userType": "Doctor", "hospitalName": hospital_name}):
+                return u, None
+        return None, ("Please select the proper hospital.", "hospital", status.HTTP_401_UNAUTHORIZED)
 
-    if session_data["expires_at"] < now:
-        sessions_collection.delete_one({"session_id": session_id})  # Remove expired session
-        return JsonResponse({"status": "error", "message": "Session expired"}, status=401)
 
-    return JsonResponse({
-        "status": "success",
-        "message": "Session is valid",
-        "email": session_data.get("email"),
-        "userType": session_data.get("userType"),
-        "hospitalName": session_data.get("hospitalName"),
-    }, status=200)
+def _user_data(user):
+    """What the site needs to know about the logged-in account."""
+    return {
+        "userType": user.get("userType"),
+        "email": user.get("email"),
+        "hospitalName": user.get("hospitalName"),
+        "name": user.get("name"),
+        "contactNo": str(user.get("contactNo") or ""),
+    }
 
-@csrf_exempt
-def logout_view(request):
-    if request.method == "POST":
+
+def set_session_cookie(response, token):
+    response.set_cookie(
+        settings.AUTH_COOKIE_NAME, token,
+        max_age=settings.SESSION_EXPIRY_HOURS * 3600,
+        httponly=True, secure=settings.AUTH_COOKIE_SECURE, samesite=settings.AUTH_COOKIE_SAMESITE, path="/",
+    )
+
+
+def clear_session_cookie(response):
+    response.delete_cookie(settings.AUTH_COOKIE_NAME, path="/", samesite=settings.AUTH_COOKIE_SAMESITE)
+
+
+class SessionAPIView(APIView):
+    """
+    GET /api/accounts/session/  (no login needed)
+    Who is logged in on this browser? Reads the httpOnly session cookie and checks the server
+    session. Answers 200 either way: {status: "success", access, userData} or {status: "none"}.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    # Called on every page load / tab: not part of the anonymous rate limit (that limit protects
+    # login from password guessing). It reveals nothing without a valid session cookie.
+    throttle_classes = []
+
+    def get(self, request):
+        token = request.COOKIES.get(settings.AUTH_COOKIE_NAME)
+        none = Response({"status": "none"}, status=status.HTTP_200_OK)
+        if not token:
+            return none
+        session = sessions_collection.find_one({"token": token})
+        valid = bool(session) and (not session.get("expires_at") or session["expires_at"] > datetime.utcnow())
+        payload = None
+        if valid:
+            try:
+                payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+            except jwt.PyJWTError:
+                valid = False
+        user = None
+        if valid:
+            query = {"email": payload.get("email"), "userType": payload.get("userType")}
+            if payload.get("hospitalName") and str(payload.get("userType")).lower() == "patient":
+                query["hospitalName"] = payload["hospitalName"]
+            user = users_collection.find_one(query)
+            valid = bool(user) and bool(user.get("is_active", False))
+        if not valid:
+            if session:
+                sessions_collection.delete_one({"token": token})
+            clear_session_cookie(none)
+            return none
+        return Response({"status": "success", "access": token, "userData": _user_data(user)}, status=status.HTTP_200_OK)
+
+
+class LogoutAPIView(generics.CreateAPIView):
+    """
+    User logout endpoint
+    POST /api/accounts/logout/
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    serializer_class = LogoutSerializer
+
+    def create(self, request, *args, **kwargs):
+        # Read token from header and remove session document
+        auth = request.headers.get("Authorization") or request.META.get("HTTP_AUTHORIZATION")
+        token = None
+        if auth and auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        for t in {token, request.COOKIES.get(settings.AUTH_COOKIE_NAME)} - {None, ""}:
+            sessions_collection.delete_one({"token": t})
+        response = Response({"status": "success", "message": "Logout successful"}, status=status.HTTP_200_OK)
+        clear_session_cookie(response)
+        return response
+
+
+
+
+
+
+
+
+
+class VerifyUserAPIView(APIView):
+    """
+    Verify if user is logged in and get basic info
+    GET /api/accounts/verify/
+    Returns: { status, user: { email, userType, hospitalName } }
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+    
+    def get(self, request, *args, **kwargs):
         try:
-            data = json.loads(request.body)
-            session_id = data.get("session_id")
+            email = getattr(request.user, 'email', None)
+            userType = getattr(request.user, 'userType', None)
+            hospitalName = getattr(request.user, 'hospitalName', None)
+            
+            if not email:
+                raise exceptions.AuthenticationFailed("User email not found in token")
 
-            if not session_id:
-                return JsonResponse({"status": "error", "message": "Session ID required"}, status=400)
-
-            # Remove session from MongoDB
-            result = sessions_collection.delete_one({"session_id": session_id})
-
-            if result.deleted_count == 0:
-                return JsonResponse({"status": "error", "message": "Session not found"}, status=404)
-
-            return JsonResponse({"status": "success", "message": "Logged out successfully"}, status=200)
-
+            # current name / phone from the database, so the header and welcome banner
+            # show changes made after login (e.g. a profile edit) on the next page load
+            account = users_collection.find_one(account_query(request.user), {"name": 1, "contactNo": 1}) or {}
+            user = {"email": email, "userType": userType, "hospitalName": hospitalName}
+            if account.get("name"):
+                user["name"] = account["name"]
+            if account.get("contactNo"):
+                user["contactNo"] = str(account["contactNo"])
+            return Response({"status": "success", "user": user}, status=status.HTTP_200_OK)
+        except exceptions.AuthenticationFailed as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_401_UNAUTHORIZED)
         except Exception as e:
-            print(f"Logout error: {str(e)}")
-            return JsonResponse({"status": "error", "message": f"Logout failed: {str(e)}"}, status=500)
-
-    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
-
-
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class GetUserProfileAPIView(generics.RetrieveAPIView):
+    """
+    Get user profile
+    GET /api/accounts/profile/me/
+    """
+    permission_classes = [IsAuthenticated , IsSameUser]
+    serializer_class = UserProfileSerializer
+    authentication_classes = [JWTAuthentication]
 
+    def get_object(self):
+        userType = getattr(self.request.user, 'userType', None)
+        email = getattr(self.request.user, 'email', None)
+        
+        # # Get authenticated user from JWT token
+        # auth_user_email = getattr(self.request.user, 'email', None)
+        
+        # # Verify that authenticated user matches the requested profile
+        # if auth_user_email != email:
+        #     raise exceptions.PermissionDenied("You can only access your own profile")
+        
+        # Fetch user from database
+        user_doc = users_collection.find_one(account_query(self.request.user))
+        
+        if not user_doc:
+            raise exceptions.NotFound("User not found")
+        
+        # Convert ObjectId to string and remove sensitive data
+        user_doc["_id"] = str(user_doc["_id"])
+        for secret in ("hpassword", "password", "inviteTokenHash", "inviteExpiresAt"):
+            user_doc.pop(secret, None)
 
+        # doctors: department + roles come from the staff record (where admins assign them)
+        if user_doc.get("userType") == "Doctor":
+            staff = staff_collection.find_one({"email": user_doc.get("email"), "role": "Doctor",
+                                               "hospitalName": user_doc.get("hospitalName")}) or {}
+            user_doc["department"] = staff.get("department") or user_doc.get("department")
+            user_doc["roles"] = staff.get("roles") or []
+            user_doc["isDepartmentHead"] = "Department Head" in user_doc["roles"]
 
+        return user_doc
 
-
-
-
-
-
-
-# logic for user profile and update views
-
-# user profile all backend code
-@csrf_exempt
-def get_user_profile(request, user_type, email):
-    if request.method == "GET":
+    def retrieve(self, request, *args, **kwargs):
+        """Return all stored data for the user"""
         try:
-            print(f"Fetching profile for {user_type}: {email}")
+            instance = self.get_object()
             
-            # Verify session instead of token
-            auth_header = request.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                return JsonResponse({"status": "error", "message": "No session ID provided"}, status=401)
+            # Return all data from database without filtering
+            return Response({
+                "status": "success",
+                "user": instance
+            }, status=status.HTTP_200_OK)
             
-            session_id = auth_header.split(' ')[1]
+        except exceptions.PermissionDenied as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_403_FORBIDDEN)
             
-            # Get session data from MongoDB
-            session_data = sessions_collection.find_one({"session_id": session_id})
-            
-            if not session_data:
-                return JsonResponse({"status": "error", "message": "Session not found"}, status=401)
-                
-            # Check if session is expired
-            if session_data["expires_at"] < datetime.now():
-                sessions_collection.delete_one({"session_id": session_id})  # Clean up expired session
-                return JsonResponse({"status": "error", "message": "Session expired"}, status=401)
-
-            # Find user in MongoDB
-            user = users_collection.find_one({
-                "email": email,
-                "userType": user_type.capitalize()  # Match user type
-            })
-            
-            if not user:
-                return JsonResponse({
-                    "status": "error", 
-                    "message": f"User not found with email: {email} and type: {user_type}"
-                }, status=404)
-            
-            # Convert ObjectId to string
-            user["_id"] = str(user["_id"])
-            
-            # Remove sensitive information
-            if "hpassword" in user:
-                del user["hpassword"]
-            
-            return JsonResponse(user, status=200, safe=False)
+        except exceptions.NotFound as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_404_NOT_FOUND)
             
         except Exception as e:
-            print(f"Error in get_user_profile: {str(e)}")
-            return JsonResponse({"status": "error", "message": str(e)}, status=500)
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
 
 
 
-@csrf_exempt
-def update_profile(request, userType, email):
-    if request.method == "POST":
+
+
+class UpdateUserProfileAPIView(generics.UpdateAPIView):
+    """
+    Update user profile
+    PUT/PATCH /api/accounts/profile/me/update/
+    """
+    serializer_class = UserProfileSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [IsAuthenticated, IsSameUser]
+    authentication_classes = [JWTAuthentication]
+
+    def get_object(self):
+        userType = getattr(self.request.user, 'userType', None)
+        email = getattr(self.request.user, 'email', None)
+        
+        # # Get authenticated user email from JWT token
+        # auth_user_email = getattr(self.request.user, 'email', None)
+        
+        # # Verify that authenticated user matches the requested profile
+        # if auth_user_email != email:
+        #     raise exceptions.PermissionDenied("You can only update your own profile")
+        
+        # Fetch user from database
+        user_doc = users_collection.find_one(account_query(self.request.user))
+        
+        if not user_doc:
+            raise exceptions.NotFound("User not found")
+        
+        return user_doc
+
+    def update(self, request, *args, **kwargs):
+        """Handle profile update with validation"""
+        partial = kwargs.pop('partial', True)  # Allow partial updates
+        instance = self.get_object()
+        
+        # Create serializer with current instance and update data
+        serializer = self.get_serializer(
+            instance, 
+            data=request.data, 
+            partial=partial,
+            context={'request': request}
+        )
+        
+        if not serializer.is_valid():
+            return Response({
+                "status": "error",
+                "errors": serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
         try:
-            # Verify session
-            auth_header = request.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                return JsonResponse({"status": "error", "message": "No session ID provided"}, status=401)
+            # Perform the update
+            self.perform_update(serializer)
+            
+            # Fetch updated user from database
+            email = getattr(request.user, 'email', None)
+            userType = getattr(request.user, 'userType', None)
+            
+            updated_user = users_collection.find_one(account_query(request.user))
+            
+            if not updated_user:
+                raise exceptions.NotFound("User not found after update")
+            
+            # Remove sensitive data
+            updated_user["_id"] = str(updated_user["_id"])
+            for secret in ("hpassword", "password", "inviteTokenHash", "inviteExpiresAt"):
+                updated_user.pop(secret, None)
+            updated_user.pop("password", None)
+            
+            # Return all updated data
+            return Response({
+                "status": "success",
+                "message": "Profile updated successfully",
+                "user": updated_user
+            }, status=status.HTTP_200_OK)
+            
+        except exceptions.PermissionDenied as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_403_FORBIDDEN)
+            
+        except Exception as e:
+            return Response({
+                "status": "error",
+                "message": str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            # Parse request data
-            data = request.POST.dict() if request.content_type.startswith('multipart') else json.loads(request.body)
-            update_data = {key: value for key, value in data.items() if key != "email"}
-
-            # Handle profile photo upload
-            if request.FILES and 'photo' in request.FILES:
-                photo = request.FILES['photo']
-                photo_name = default_storage.save(
-                    f"profile_photos/{email}/{photo.name}",
-                    ContentFile(photo.read())
-                )
-                update_data["photo"] = default_storage.url(photo_name)
-
-            # Handle doctor certificate upload (if applicable)
-            if userType.lower() == "doctor" and request.FILES and 'doctorCertificate' in request.FILES:
-                certificate = request.FILES['doctorCertificate']
+    def perform_update(self, serializer):
+        """Perform the actual database update"""
+        email = getattr(self.request.user, 'email', None)
+        userType = getattr(self.request.user, 'userType', None)
+        validated_data = serializer.validated_data
+        
+        # Build update dictionary (exclude read-only fields)
+        update_data = {}
+        
+        # Common updatable fields.
+        # hospitalName is NOT editable: it is fixed by the hospital chosen at registration/login.
+        updatable_fields = ['name', 'contactNo', 'gender', 'dateOfBirth']
+        
+        for field in updatable_fields:
+            if field in validated_data:
+                update_data[field] = validated_data[field]
+        
+        # Handle password update
+        if 'password' in validated_data:
+            new_password = validated_data['password']
+            hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt())
+            update_data['hpassword'] = hashed.decode("utf-8")
+        
+        # Handle photo upload
+        if 'photo' in self.request.FILES:
+            photo = self.request.FILES['photo']
+            photo_name = default_storage.save(
+                f"profile_photos/{email}/{photo.name}",
+                ContentFile(photo.read())
+            )
+            update_data['photo'] = default_storage.url(photo_name)
+        
+        # Doctor-specific fields
+        if userType.lower() == "doctor":
+            doctor_fields = ['doctorQualification', 'doctorSpecialization']
+            for field in doctor_fields:
+                if field in validated_data:
+                    update_data[field] = validated_data[field]
+            
+            # Handle doctor certificate upload
+            if 'doctorCertificate' in self.request.FILES:
+                certificate = self.request.FILES['doctorCertificate']
                 cert_name = default_storage.save(
                     f"doctor_certificates/{email}/{certificate.name}",
                     ContentFile(certificate.read())
                 )
-                update_data["doctorCertificate"] = default_storage.url(cert_name)
-
-            # Update the appropriate collection
-            if userType.lower() == "doctor":
-                result = doctors_collection.update_one(
-                    {"email": email, "userType": "Doctor"},
-                    {"$set": update_data}
-                )
-            else:
-                result = users_collection.update_one(
-                    {"email": email, "userType": userType.capitalize()},
-                    {"$set": update_data}
-                )
-
-            if result.matched_count == 0:
-                return JsonResponse({"status": "error", "message": "User not found"}, status=404)
-
-            return JsonResponse({"status": "success", "message": "Profile updated successfully"}, status=200)
-
-        except Exception as e:
-            print(f"Error in update_profile: {str(e)}")
-            return JsonResponse({"status": "error", "message": str(e)}, status=500)
-
-    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
-
-
-@csrf_exempt
-def get_company_name(request,email):
-    if request.method == "GET":
-        try:
-            user = users_collection.find_one({"email": email, "userType": "Supplier"})
-            if not user:
-                return JsonResponse({"status": "error", "message": "Supplier not found"}, status=404)
+                update_data['doctorCertificate'] = default_storage.url(cert_name)
+        
+        # Supplier-specific fields
+        elif userType.lower() == "supplier":
+            supplier_fields = ['companyName', 'companyStartingDate']
+            for field in supplier_fields:
+                if field in validated_data:
+                    update_data[field] = validated_data[field]
             
-            companyName = user.get("companyName")
-            return JsonResponse({"status": "success", "companyName": companyName}, status=200)
-        except Exception as e:
-            return JsonResponse({"status": "error", "message": str(e)}, status=500)
+            # Handle company license upload
+            if 'companyLicense' in self.request.FILES:
+                license_file = self.request.FILES['companyLicense']
+                license_name = default_storage.save(
+                    f"company_licenses/{email}/{license_file.name}",
+                    ContentFile(license_file.read())
+                )
+                update_data['companyLicense'] = default_storage.url(license_name)
+        
+        # Add updated timestamp
+        update_data['updated_at'] = datetime.utcnow()
+        
+        # Update in users collection
+        result = users_collection.update_one(
+            account_query(self.request.user),
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise exceptions.NotFound("User not found")
+        
+        # Update in staff collection if doctor (never copy the password hash into staff:
+        # staff records are returned by the public doctor list).
+        if userType.lower() == "doctor":
+            staff_fields = {
+                "name": "name", "contactNo": "contactNo", "photo": "photo",
+                "doctorQualification": "qualification", "doctorSpecialization": "specialization",
+                "doctorCertificate": "certificate", "updated_at": "updated_at",
+            }
+            staff_update = {staff_fields[k]: v for k, v in update_data.items() if k in staff_fields}
+            staff_collection.update_one(
+                {"email": email},
+                {"$set": staff_update}
+            )
 
-    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
+
+
+
+
+
+
+
+class GetCompanyNameAPIView(APIView):
+    """
+    Get supplier company name
+    GET /api/accounts/get_company_name/<email>/
+    """
+    permission_classes = [IsAuthenticated, IsSuperAdminOrIsSameHospitalAdmin]
+    
+    def get(self, request, email):
+        """Get company name for supplier"""
+        supplier = users_collection.find_one({"email": email, "userType": "Supplier"})
+        if not supplier:
+            return Response({"status": "error", "message": "Supplier not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Enforce object-level permission for the fetched supplier record.
+        self.check_object_permissions(request, supplier)
+
+        return Response({"status": "success", "companyName": supplier.get("companyName")}, status=status.HTTP_200_OK)
+
+
+
+# ==================== FORGOT PASSWORD ====================
+RESET_CODE_MINUTES = 10
+RESET_MAX_ATTEMPTS = 5
+RESET_PURPOSE = "password_reset"
+
+
+def _send_reset_email(email: str, code: str, name: str = None):
+    display = name or email.split("@", 1)[0]
+    text = (f"Hello {display},\n\nYour EasyTreat password reset code is: {code}\n"
+            f"It expires in {RESET_CODE_MINUTES} minutes.\n\n"
+            "If you did not ask to reset your password, ignore this email.")
+    html = (f"<p>Hello {display},</p><p>Your EasyTreat password reset code is: <strong>{code}</strong></p>"
+            f"<p>It expires in {RESET_CODE_MINUTES} minutes.</p>"
+            "<p>If you did not ask to reset your password, ignore this email.</p>")
+    msg = EmailMultiAlternatives(
+        subject="EasyTreat - Password reset code",
+        body=text,
+        from_email=settings.EMAIL_HOST_USER,
+        to=[email],
+    )
+    msg.attach_alternative(html, "text/html")
+    msg.send(fail_silently=False)
+
+
+class PasswordResetRequestAPIView(APIView):
+    """
+    POST /api/accounts/password-reset/request/   { "email": "..." }
+    Emails a 6-digit code. Always answers the same way, so it does not reveal
+    whether an account exists for that email.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [AnonRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"status": "error", "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        generic = {
+            "status": "success",
+            "message": f"If an account exists for {email}, a reset code has been sent. It expires in {RESET_CODE_MINUTES} minutes.",
+        }
+
+        user = users_collection.find_one({"email": email}, {"name": 1})
+        if not user:
+            return Response(generic, status=status.HTTP_200_OK)
+
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        now = utc_now()
+        otp_collection.delete_many({"email": email, "purpose": RESET_PURPOSE})
+        otp_collection.insert_one({
+            "email": email,
+            "purpose": RESET_PURPOSE,
+            "codeHash": hash_code(code),
+            "attempts": 0,
+            "created_at": now,
+            "expires_at": now + timedelta(minutes=RESET_CODE_MINUTES),
+        })
+
+        try:
+            _send_reset_email(email, code, user.get("name"))
+        except Exception as exc:
+            if settings.DEBUG:
+                # Local development only: email is not configured, so print the code in the server log.
+                logger.warning("Password reset email failed (%s). DEBUG code for %s: %s", exc, email, code)
+                print(f"[DEBUG] Password reset code for {email}: {code}  (email sending failed: {exc})", flush=True)
+            else:
+                logger.error("Password reset email failed for %s: %s", email, exc)
+                otp_collection.delete_many({"email": email, "purpose": RESET_PURPOSE})
+                return Response({
+                    "status": "error",
+                    "message": "Could not send the reset email right now. Please try again later.",
+                }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response(generic, status=status.HTTP_200_OK)
+
+
+class PasswordResetConfirmAPIView(APIView):
+    """
+    POST /api/accounts/password-reset/confirm/   { "email", "otp", "newPassword" }
+    Sets the new password on every account of that email (a patient may have one per hospital)
+    and logs out all existing sessions.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = [AnonRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({"status": "error", "errors": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        email = serializer.validated_data["email"]
+        code = serializer.validated_data["otp"]
+        invalid = Response({"status": "error", "message": "Invalid or expired code. Request a new one."},
+                           status=status.HTTP_400_BAD_REQUEST)
+
+        record = otp_collection.find_one({"email": email, "purpose": RESET_PURPOSE})
+        if not record or record.get("expires_at") is None or record["expires_at"] <= utc_now():
+            if record:
+                otp_collection.delete_one({"_id": record["_id"]})
+            return invalid
+
+        if not secrets.compare_digest(record.get("codeHash", ""), hash_code(code)):
+            attempts = record.get("attempts", 0) + 1
+            if attempts >= RESET_MAX_ATTEMPTS:
+                otp_collection.delete_one({"_id": record["_id"]})
+                return Response({"status": "error", "message": "Too many wrong attempts. Request a new code."},
+                                status=status.HTTP_400_BAD_REQUEST)
+            otp_collection.update_one({"_id": record["_id"]}, {"$set": {"attempts": attempts}})
+            return invalid
+
+        new_hash = bcrypt.hashpw(serializer.validated_data["newPassword"].encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        result = users_collection.update_many(
+            {"email": email},
+            {"$set": {"hpassword": new_hash, "updated_at": utc_now()}, "$unset": {"password": ""}},
+        )
+        otp_collection.delete_many({"email": email, "purpose": RESET_PURPOSE})
+        sessions_collection.delete_many({"email": email})
+
+        if result.matched_count == 0:
+            return invalid
+        return Response({"status": "success", "message": "Password updated. You can now log in with your new password."},
+                        status=status.HTTP_200_OK)
