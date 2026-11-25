@@ -14,6 +14,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 from urllib.parse import quote_plus
 
@@ -28,7 +29,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv("SECRET_KEY", "1fy%j02cvs&0$)-ny@3pj6l$+p)%cl6_ogu0h8-z=!&sy*v_ju")
+# Read only from Backend/.env (never written in code). Django uses it to sign data such as
+# password-reset tokens; a new key for production: python -c "import secrets; print(secrets.token_urlsafe(50))"
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY is missing. Add it to Backend/.env")
 
 # Razorpay keys and the booking fee are now stored in the database and edited on the
 # super admin Settings page (backend/platform_settings.py). Old .env reading kept as a comment
@@ -235,13 +240,18 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Configure where to store uploaded files
 DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
 
-# MongoDB Settings
+# MongoDB Atlas - every part comes from Backend/.env:
+#   MONGO_USERNAME / MONGO_PASSWORD  the database user (Atlas > Database Access)
+#   MONGO_CLUSTER                    the cluster address, e.g. cluster0.xxxxx.mongodb.net (Atlas > Connect)
+#   MONGO_DATABASE                   the database name inside the cluster
+_missing = [k for k in ("MONGO_USERNAME", "MONGO_PASSWORD", "MONGO_CLUSTER", "MONGO_DATABASE") if not os.getenv(k)]
+if _missing:
+    raise ImproperlyConfigured(f"Missing in Backend/.env: {', '.join(_missing)}")
 MONGO_USERNAME = quote_plus(os.getenv('MONGO_USERNAME'))
 MONGO_PASSWORD = quote_plus(os.getenv('MONGO_PASSWORD'))
-MONGO_CLUSTER = os.getenv('MONGO_CLUSTER')
-MONGO_DATABASE = os.getenv('MONGO_DATABASE')
+MONGO_CLUSTER = os.getenv('MONGO_CLUSTER').strip()
+MONGO_DATABASE = os.getenv('MONGO_DATABASE').strip()
 
-# MongoDB URI - use the cluster from your screenshot
-MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@cluster0.sqzac.mongodb.net/{MONGO_DATABASE}?retryWrites=true&w=majority"
+MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{MONGO_PASSWORD}@{MONGO_CLUSTER}/{MONGO_DATABASE}?retryWrites=true&w=majority"
 
 
