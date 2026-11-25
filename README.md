@@ -73,8 +73,8 @@ Every person logs in with their own role and only sees what belongs to their wor
 
 ### 1. Download
 ```bash
-git clone https://github.com/Mihirdhami7/HMS-Major-Project.git
-cd HMS-Major-Project
+git clone https://github.com/Mihirdhami7/EasyTreat.git
+cd EasyTreat
 ```
 
 ### 2. Backend
