@@ -11,6 +11,7 @@ import { Card, Empty, Modal } from "../Supplier/SupplierUi";
 import { money, PAGE_FRAME, inputClass, labelClass } from "../Supplier/supplierUtils";
 import { KpiCard, InviteLinkBox, AccountStatus } from "./SuperAdminUi";
 import { AXIS, GRID, CURSOR } from "./superAdminConfig";
+import DateField from "../../components/ui/DateField";
 
 const emptyHospital = { name: "", description: "", address: "", contactNo: "" };
 const emptyAdmin = { name: "", email: "", contactNo: "", gender: "", dateOfBirth: "", hospitalName: "" };
@@ -437,8 +438,8 @@ export default function Hospitals() {
               </div>
               <div>
                 <label className={labelClass} htmlFor="a-dob">Date of birth<span className="text-red-500"> *</span></label>
-                <input id="a-dob" type="date" className={inputClass} value={adminForm.dateOfBirth} max={new Date().toISOString().slice(0, 10)}
-                  onChange={(e) => setAdminForm({ ...adminForm, dateOfBirth: e.target.value })} />
+                <DateField id="a-dob" value={adminForm.dateOfBirth} max="today" birthDate placeholder="Select date of birth"
+                  onChange={(v) => setAdminForm({ ...adminForm, dateOfBirth: v })} />
               </div>
             </div>
             <p className="text-xs text-gray-400">Fields marked <span className="text-red-500">*</span> are required. The admin sets their own password from the email link.</p>

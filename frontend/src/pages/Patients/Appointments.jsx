@@ -10,6 +10,7 @@ import { getMyAppointments, getMyPrescriptions } from "../../services/appointmen
 import PrescriptionActions from "../../components/patient/PrescriptionActions";
 import { createRazorpayOrder, verifyRazorpayPayment } from "../../services/paymentService";
 import { usePublicSettings } from "../../hooks/usePublicSettings";
+import DateField from "../../components/ui/DateField";
 
 
 // Values must be "HH:MM" (BookAppointmentSerializer.validate_appointmentTime).
@@ -545,13 +546,11 @@ function Appointment() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
                   <div>
                     <label className="block text-gray-700 font-medium mb-2">Select Date</label>
-                    <input
-                      type="date"
+                    <DateField
                       min={today}
-                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                       value={appointmentDate}
-                      required
-                      onChange={(e) => setAppointmentDate(e.target.value)}
+                      onChange={setAppointmentDate}
+                      style={{ height: 50 }}
                     />
                   </div>
 

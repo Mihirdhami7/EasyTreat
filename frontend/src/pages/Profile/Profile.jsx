@@ -9,6 +9,7 @@ import { mediaUrl, pickList } from "../../services/apiClient";
 import { useAuth } from "../../context/AuthContext";
 import { doctorName } from "../../utils/format";
 import PrescriptionActions from "../../components/patient/PrescriptionActions";
+import DateField from "../../components/ui/DateField";
 
 const DEFAULT_AVATAR = "/images/avatar-icon.png";
 
@@ -344,7 +345,8 @@ function Profile() {
                                     label="Date of Birth"
                                     value={userData.dateOfBirth}
                                     editing={isEditing}
-                                    input={<input type="date" name="dateOfBirth" value={editableData.dateOfBirth || ""} onChange={handleInputChange} className={inputClass} />}
+                                    input={<DateField className="mt-1" max="today" birthDate value={editableData.dateOfBirth || ""}
+                                        onChange={(v) => setEditableData((prev) => ({ ...prev, dateOfBirth: v }))} />}
                                 />
                             )}
                             {!isSupplier && (
@@ -441,7 +443,8 @@ function Profile() {
                                 label="Company Since"
                                 value={userData.companyStartingDate}
                                 editing={isEditing}
-                                input={<input type="date" name="companyStartingDate" value={editableData.companyStartingDate || ""} onChange={handleInputChange} className={inputClass} />}
+                                input={<DateField className="mt-1" max="today" value={editableData.companyStartingDate || ""}
+                                    onChange={(v) => setEditableData((prev) => ({ ...prev, companyStartingDate: v }))} />}
                             />
                             <Field
                                 icon={FiFileText}

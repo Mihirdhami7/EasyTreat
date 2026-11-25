@@ -134,6 +134,7 @@ class TestRazorpayView(APIView):
 class PublicSettingsView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
+    throttle_classes = []  # read on the booking pages; only the public booking fee
 
     def get(self, request):
         s = get_settings()

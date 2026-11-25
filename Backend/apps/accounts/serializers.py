@@ -3,6 +3,7 @@ from datetime import datetime
 from rest_framework import serializers
 
 from backend.db import users_collection
+from .validators import MIN_AGE, check_birth_date
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):
@@ -148,6 +149,14 @@ class RegisterSerializer(serializers.Serializer):
                 if not data.get(field):
                     errors[field] = error_msg
         
+        # date of birth: a real date, not in the future, old enough for the role
+        if data.get('dateOfBirth') and 'dateOfBirth' not in errors:
+            who = {"Doctor": "Doctors", "Supplier": "Suppliers"}.get(userType, "You")
+            try:
+                data['dateOfBirth'] = check_birth_date(data['dateOfBirth'], MIN_AGE.get(userType, 18), who)
+            except serializers.ValidationError as exc:
+                errors['dateOfBirth'] = exc.detail[0] if isinstance(exc.detail, list) else exc.detail
+
         if errors:
             raise serializers.ValidationError(errors)
         

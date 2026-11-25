@@ -1,11 +1,14 @@
 import './App.css';
 import { AuthProvider } from './context/AuthContext';
 import Layout from './layout/mainlayout';
+import AntdThemeProvider from './components/ui/AntdThemeProvider';
 
 function App() {
   return (
     <AuthProvider>
-      <Layout />
+      <AntdThemeProvider>
+        <Layout />
+      </AntdThemeProvider>
     </AuthProvider>
   );
 }

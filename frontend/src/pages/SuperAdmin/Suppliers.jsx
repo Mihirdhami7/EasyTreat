@@ -10,6 +10,7 @@ import { Card, Empty, Modal } from "../Supplier/SupplierUi";
 import { money, PAGE_FRAME, inputClass, labelClass } from "../Supplier/supplierUtils";
 import { KpiCard, PeriodTabs, InviteLinkBox, AccountStatus } from "./SuperAdminUi";
 import { AXIS, GRID, CURSOR, ORDER_STATUS, fmtDate } from "./superAdminConfig";
+import DateField from "../../components/ui/DateField";
 
 const emptySupplier = { companyName: "", name: "", email: "", contactNo: "", companyStartingDate: "", companyLicense: null };
 const MAX_LICENSE_MB = 5;
@@ -333,8 +334,8 @@ export default function Suppliers() {
             </div>
             <div>
               <label className={labelClass} htmlFor="s-started">Company starting date<span className="text-red-500"> *</span></label>
-              <input id="s-started" type="date" className={inputClass} value={form.companyStartingDate} max={new Date().toISOString().slice(0, 10)}
-                onChange={(e) => setForm({ ...form, companyStartingDate: e.target.value })} />
+              <DateField id="s-started" value={form.companyStartingDate} max="today"
+                onChange={(v) => setForm({ ...form, companyStartingDate: v })} />
             </div>
             <div>
               <label className={labelClass} htmlFor="s-license">Company license (PDF)<span className="text-red-500"> *</span></label>

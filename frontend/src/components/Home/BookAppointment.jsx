@@ -1,6 +1,7 @@
 import { useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { Phone, ArrowRight } from "lucide-react"
+import DateField from "../ui/DateField";
 
 export default function BookAppointment() {
   const navigate = useNavigate()
@@ -52,12 +53,11 @@ export default function BookAppointment() {
                 </div>
                 <div>
                   <label className="text-xs text-gray-500 mb-1 block">Appointment Date</label>
-                  <input
-                    type="date"
+                  <DateField
                     value={form.date}
-                    onChange={e => setForm({ ...form, date: e.target.value })}
-                    className="w-full border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-700
-                               focus:outline-none focus:border-[#1D9E75] focus:ring-1 focus:ring-[#1D9E75] transition-all"
+                    onChange={(v) => setForm({ ...form, date: v })}
+                    min="today"
+                    style={{ height: 46, borderRadius: 12 }}
                   />
                 </div>
               </div>

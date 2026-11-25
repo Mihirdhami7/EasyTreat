@@ -1,15 +1,15 @@
 import { useState } from "react";
 import PropTypes from "prop-types";
 import { Link, useNavigate } from "react-router-dom";
-import DatePicker from "react-datepicker";
-import "react-datepicker/dist/react-datepicker.css";
-import { FiUser, FiMail, FiLock, FiPhone, FiCalendar, FiHome, FiAward, FiActivity, FiBriefcase } from "react-icons/fi";
+import { FiUser, FiMail, FiLock, FiPhone, FiHome, FiAward, FiActivity, FiBriefcase } from "react-icons/fi";
+import { ConfigProvider } from "antd";
 import { registerUser, verifyEmail } from "../../services/authService";
 import { useHospitals } from "../../hooks/useHospitals";
 import AuthLayout from "../../components/auth/AuthLayout";
 import { IconInput, PasswordInput, IconSelect, FieldShell, AuthMessage } from "../../components/auth/AuthFields";
 import AlreadyLoggedIn from "../../components/auth/AlreadyLoggedIn";
 import { useAuth } from "../../context/AuthContext";
+import DateField from "../../components/ui/DateField";
 
 // Roles offered on public signup. Hospital admins are added only by the super admin (email link);
 // suppliers can sign up here or be added by the super admin.
@@ -19,19 +19,12 @@ const SIGNUP_ROLES = [
   { key: "Supplier", icon: "🚚" },
 ];
 
-const dateInputClass =
-  "w-full py-2.5 pl-10 pr-3 rounded-xl border text-sm bg-white dark:bg-gray-900 dark:text-gray-100 border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500";
 const fileInputClass =
   "block w-full text-sm text-gray-600 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-xl p-1.5 " +
   "file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:bg-blue-50 file:text-blue-700 file:font-medium hover:file:bg-blue-100";
 
-// Backend stores dates as plain strings → send YYYY-MM-DD.
-const toIsoDate = (date) => {
-  if (!date) return "";
-  const d = new Date(date);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-};
+// Dates are kept as YYYY-MM-DD strings, the format the backend stores.
+const toIsoDate = (value) => (value ? String(value).slice(0, 10) : "");
 
 const EMPTY_FORM = {
   name: "",
@@ -39,7 +32,7 @@ const EMPTY_FORM = {
   password: "",
   confirmPassword: "",
   contactNo: "",
-  dateOfBirth: null,
+  dateOfBirth: "",
   userType: "Patient",
   gender: "Male",
   photo: null,
@@ -48,7 +41,7 @@ const EMPTY_FORM = {
   doctorCertificate: null,
   hospitalName: "",
   companyName: "",
-  companyStartingDate: null,
+  companyStartingDate: "",
   companyLicense: null,
 };
 
@@ -296,6 +289,7 @@ export default function Signup() {
     >
       {message && <AuthMessage tone={isError ? "error" : "success"}>{message}</AuthMessage>}
 
+      <ConfigProvider theme={{ token: { borderRadius: 12 } }}>
       <form className="space-y-7" onSubmit={handleSubmit} noValidate>
         {/* Role */}
         <div>
@@ -341,19 +335,16 @@ export default function Signup() {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <IconInput required id="contactNo" name="contactNo" type="tel" label="Contact number" icon={FiPhone} placeholder="10 digits"
               value={formData.contactNo} onChange={handleChange} error={errors.contactNo} />
-            <FieldShell label={isSupplier ? "Date of birth (optional)" : "Date of birth"} required={!isSupplier} htmlFor="dateOfBirth" icon={FiCalendar} error={errors.dateOfBirth}>
-              <DatePicker
+            <FieldShell label={isSupplier ? "Date of birth (optional)" : "Date of birth"} required={!isSupplier}
+              htmlFor="dateOfBirth" error={errors.dateOfBirth}>
+              <DateField
                 id="dateOfBirth"
-                selected={formData.dateOfBirth}
-                onChange={(date) => setField("dateOfBirth", date)}
-                className={`${dateInputClass} ${errors.dateOfBirth ? "!border-red-400 !bg-red-50" : ""}`}
-                wrapperClassName="w-full"
-                placeholderText="dd/mm/yyyy"
-                dateFormat="dd/MM/yyyy"
-                maxDate={new Date()}
-                showYearDropdown
-                scrollableYearDropdown
-                yearDropdownItemNumber={100}
+                placeholder="Select date of birth"
+                status={errors.dateOfBirth ? "error" : ""}
+                value={formData.dateOfBirth}
+                onChange={(v) => setField("dateOfBirth", v)}
+                max="today"
+                birthDate
               />
             </FieldShell>
             <IconSelect required={!isSupplier} id="gender" name="gender" label="Gender" icon={FiUser} value={formData.gender} onChange={handleChange} error={errors.gender}>
@@ -391,19 +382,14 @@ export default function Signup() {
               <IconInput required id="companyName" name="companyName" label="Company name" icon={FiBriefcase}
                 placeholder="e.g. MedPlus Supply" value={formData.companyName} onChange={handleChange} error={errors.companyName}
                 hint="Use the exact name hospitals know you by — your products and orders are linked to it." />
-              <FieldShell label="Company starting date" required htmlFor="companyStartingDate" icon={FiCalendar} error={errors.companyStartingDate}>
-                <DatePicker
+              <FieldShell label="Company starting date" required htmlFor="companyStartingDate" error={errors.companyStartingDate}>
+                <DateField
                   id="companyStartingDate"
-                  selected={formData.companyStartingDate}
-                  onChange={(date) => setField("companyStartingDate", date)}
-                  className={`${dateInputClass} ${errors.companyStartingDate ? "!border-red-400 !bg-red-50" : ""}`}
-                  wrapperClassName="w-full"
-                  placeholderText="dd/mm/yyyy"
-                  dateFormat="dd/MM/yyyy"
-                  maxDate={new Date()}
-                  showYearDropdown
-                  scrollableYearDropdown
-                  yearDropdownItemNumber={100}
+                  placeholder="Select date"
+                  status={errors.companyStartingDate ? "error" : ""}
+                  value={formData.companyStartingDate}
+                  onChange={(v) => setField("companyStartingDate", v)}
+                  max="today"
                 />
               </FieldShell>
             </div>
@@ -435,6 +421,7 @@ export default function Signup() {
           {submitting ? "Creating account..." : "Create account"}
         </button>
       </form>
+      </ConfigProvider>
     </AuthLayout>
   );
 }

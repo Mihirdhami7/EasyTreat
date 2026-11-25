@@ -16,6 +16,7 @@ import { createRazorpayOrder, verifyRazorpayPayment } from "../../services/payme
 import { doctorName } from "../../utils/format";
 import { usePublicSettings } from "../../hooks/usePublicSettings";
 import { InviteLinkBox } from "../SuperAdmin/SuperAdminUi";
+import DateField from "../../components/ui/DateField";
 
 const RAZORPAY_SRC = "https://checkout.razorpay.com/v1/checkout.js";
 
@@ -169,6 +170,20 @@ const NewRegister = () => {
     setRegInvite(null);
     if (!hospitalName) {
       setRegMsg({ error: "No hospital is linked to this admin account." });
+      return;
+    }
+    // date of birth: same rule as a patient's own sign-up (real date, not in the future, 18+)
+    const born = new Date(`${formData.dateOfBirth}T00:00:00`);
+    if (!formData.dateOfBirth || Number.isNaN(born.getTime())) {
+      setRegMsg({ error: "Enter a valid date of birth." });
+      return;
+    }
+    if (born > new Date()) {
+      setRegMsg({ error: "Date of birth cannot be in the future." });
+      return;
+    }
+    if (new Date(born.getFullYear() + 18, born.getMonth(), born.getDate()) > new Date()) {
+      setRegMsg({ error: "The patient must be at least 18 years old." });
       return;
     }
     setRegLoading(true);
@@ -596,7 +611,8 @@ const NewRegister = () => {
                   </div>
                   <div>
                     <label className={labelClass}>Date of Birth<span className="text-red-500"> *</span></label>
-                    <input type="date" name="dateOfBirth" value={formData.dateOfBirth} onChange={handleChange} className={inputClass} required />
+                    <DateField value={formData.dateOfBirth} max="today" birthDate
+                      onChange={(v) => handleChange({ target: { name: "dateOfBirth", value: v } })} />
                   </div>
                 </div>
                 <Message {...regMsg} />
@@ -710,7 +726,7 @@ const NewRegister = () => {
                         Change date
                       </label>
                       {!acceptPatientDate && (
-                        <input type="date" value={adminDateSlot} onChange={(e) => setAdminDateSlot(e.target.value)} min={todayISO()} className={`${inputClass} mt-2`} required />
+                        <DateField value={adminDateSlot} onChange={setAdminDateSlot} min="today" className="mt-2" />
                       )}
                     </div>
                     <div>
@@ -835,12 +851,10 @@ const NewRegister = () => {
               <div className="space-y-4">
                 <div>
                   <label className={labelClass}>Appointment Date<span className="text-red-500"> *</span></label>
-                  <input
-                    type="date"
+                  <DateField
                     value={newAppointmentData.appointmentDate}
-                    onChange={(e) => setNewAppointmentData((prev) => ({ ...prev, appointmentDate: e.target.value }))}
-                    className={inputClass}
-                    min={todayISO()}
+                    onChange={(v) => setNewAppointmentData((prev) => ({ ...prev, appointmentDate: v }))}
+                    min="today"
                   />
                 </div>
                 <div>

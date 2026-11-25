@@ -86,7 +86,7 @@ body {
 .dark .divide-gray-100:not([class*="dark:"]) > * + * { border-color: #334155; }
 
 /* form fields */
-.dark input:not([type="checkbox"]):not([type="radio"]):not([class*="dark:"]),
+.dark input:not([type="checkbox"]):not([type="radio"]):not([class*="dark:"]):not(.ant-picker input),
 .dark select:not([class*="dark:"]),
 .dark textarea:not([class*="dark:"]) {
   background-color: #0f172a;
@@ -95,4 +95,3 @@ body {
 }
 .dark input::placeholder,
 .dark textarea::placeholder { color: #64748b; }
-.dark input[type="date"] { color-scheme: dark; }

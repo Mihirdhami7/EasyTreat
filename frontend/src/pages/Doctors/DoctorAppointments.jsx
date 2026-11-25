@@ -10,6 +10,7 @@ import {
   getMyPrescriptions,
   approveAppointment,
 } from "../../services/appointmentsService";
+import DateField from "../../components/ui/DateField";
 
 const apptDate = (appt) => appt.acceptedDate || appt.appointmentDate;
 const apptTime = (appt) => appt.acceptedTime || appt.requestedTime || appt.appointmentTime;
@@ -193,12 +194,11 @@ function DoctorAppointments() {
                         </td>
                         <td className="border p-3">
                           <div className="flex flex-col gap-1">
-                            <input
-                              type="date"
+                            <DateField
+                              size="small"
                               min={today}
                               value={reschedule[appt._id]?.date || ""}
-                              onChange={(e) => setRescheduleField(appt._id, "date", e.target.value)}
-                              className="border rounded px-2 py-1 text-sm"
+                              onChange={(v) => setRescheduleField(appt._id, "date", v)}
                             />
                             <input
                               type="time"

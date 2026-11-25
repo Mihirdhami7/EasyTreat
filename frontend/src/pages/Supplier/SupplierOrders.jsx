@@ -12,6 +12,7 @@ import {
   GRID, ORDER_COLORS, STATUS_LABELS, getId, orderDate, orderQty, orderAmount, orderTitle, money, capitalize,
   formatDate, sortByNewest, PAGE_FRAME, inputClass, labelClass,
 } from "./supplierUtils";
+import DateField from "../../components/ui/DateField";
 
 const RANGES = [
   { key: "week", label: "7 days" },
@@ -23,7 +24,6 @@ const STATUS_FILTERS = ["all", "requested", "processing", "completed", "cancelle
 
 const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 const monthKey = (d) => `${d.getFullYear()}-${d.getMonth()}`;
-const todayISO = () => new Date().toISOString().split("T")[0];
 
 /** Chart buckets: days for week/month, months for year/all. */
 const buildBuckets = (range, orders) => {
@@ -557,8 +557,8 @@ const SupplierOrders = () => {
                           onChange={(e) => setLine(idx, "price_per_strip", e.target.value)} className={inputClass} />
                       </td>
                       <td className="py-2 pr-3">
-                        <input type="date" min={todayISO()} value={l.expiry_date} disabled={qty === 0}
-                          onChange={(e) => setLine(idx, "expiry_date", e.target.value)} className={inputClass} />
+                        <DateField min="today" value={l.expiry_date} disabled={qty === 0}
+                          onChange={(v) => setLine(idx, "expiry_date", v)} />
                       </td>
                       <td className="py-2 text-right text-gray-800">{money(qty * (Number(l.price_per_strip) || 0))}</td>
                     </tr>

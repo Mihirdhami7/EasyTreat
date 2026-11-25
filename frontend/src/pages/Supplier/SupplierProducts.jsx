@@ -9,6 +9,7 @@ import { StatCard, Card, Empty, Modal } from "./SupplierUi";
 import {
   LOW_STOCK, getId, formatDate, isLowStock, money, PAGE_FRAME, inputClass, labelClass,
 } from "./supplierUtils";
+import DateField from "../../components/ui/DateField";
 
 const EMPTY_PRODUCT = {
   name: "",
@@ -412,13 +413,11 @@ const SupplierProducts = () => {
               </div>
               <div>
                 <label htmlFor="expiryDate" className={labelClass}>Expiry Date</label>
-                <input
-                  type="date"
+                <DateField
                   id="expiryDate"
                   value={newProduct.expiryDate}
-                  onChange={(e) => setNewProduct({ ...newProduct, expiryDate: e.target.value })}
-                  className={inputClass}
-                  min={new Date().toISOString().split("T")[0]}
+                  onChange={(v) => setNewProduct({ ...newProduct, expiryDate: v })}
+                  min="today"
                 />
               </div>
               <div>

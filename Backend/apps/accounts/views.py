@@ -485,6 +485,9 @@ class SessionAPIView(APIView):
     """
     permission_classes = [AllowAny]
     authentication_classes = []
+    # Called on every page load / tab: not part of the anonymous rate limit (that limit protects
+    # login from password guessing). It reveals nothing without a valid session cookie.
+    throttle_classes = []
 
     def get(self, request):
         token = request.COOKIES.get(settings.AUTH_COOKIE_NAME)

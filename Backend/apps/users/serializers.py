@@ -5,6 +5,8 @@ Contains only DoctorStaffSerializer - Uses accounts serializers for patient/doct
 """
 
 from rest_framework import serializers
+
+from apps.accounts.validators import MIN_AGE, check_birth_date
 from datetime import datetime
 from backend.db import hospitals_collection
 
@@ -29,17 +31,8 @@ class PatientCreateSerializer(serializers.Serializer):
         return cleaned
 
     def validate_dateOfBirth(self, value):
-        if not value:
-            return value
-
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
-            try:
-                datetime.strptime(value, fmt)
-                return value
-            except Exception:
-                continue
-
-        raise serializers.ValidationError("dateOfBirth must be in YYYY-MM-DD or DD-MM-YYYY format")
+        # same rule as a patient's own sign-up: real date, not in the future, at least 18
+        return check_birth_date(value, MIN_AGE["Patient"], "The patient")
 
     def to_representation(self, instance):
         data = {}
